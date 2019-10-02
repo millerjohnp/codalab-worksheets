@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import os, sys
 import datetime
@@ -65,7 +65,7 @@ print(
 hostname = os.environ['HOSTNAME']
 
 # Email
-admin_email = os.environ['CODALAB_ADMIN_EMAIL']
+slack_email = os.environ['CODALAB_SLACK_EMAIL']
 sender_host = os.environ['CODALAB_EMAIL_HOST']
 sender_username = os.environ['CODALAB_EMAIL_USERNAME']
 sender_password = os.environ['CODALAB_EMAIL_PASSWORD']
@@ -80,10 +80,10 @@ report = []  # Build up the current report to send in an email
 def send_email(subject, message):
     print(
         'send_email to %s from %s@%s; subject: %s; message contains %d lines'
-        % (admin_email, sender_username, sender_host, subject, len(message))
+        % (slack_email, sender_username, sender_host, subject, len(message))
     )
     sys.stdout.flush()
-    if not admin_email:
+    if not slack_email:
         return
 
     # Default to authless SMTP (supported by some servers) if user/password is unspecified.
@@ -96,11 +96,11 @@ def send_email(subject, message):
     s.ehlo()
     msg = MIMEText('<pre style="font: monospace">' + '\n'.join(message) + '</pre>', 'html')
     msg['Subject'] = 'CodaLab on %s: %s' % (hostname, subject)
-    msg['To'] = admin_email
+    msg['To'] = slack_email
     msg['From'] = 'noreply@codalab.org'
     if do_login:
         s.login(sender_username, sender_password)
-    s.sendmail(sender_username, admin_email, msg.as_string())
+    s.sendmail(sender_username, slack_email, msg.as_string())
     s.quit()
 
 
