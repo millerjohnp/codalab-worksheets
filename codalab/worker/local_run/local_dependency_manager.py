@@ -78,6 +78,8 @@ class LocalFileSystemDependencyManager(StateTransitioner, BaseDependencyManager)
         # DependencyKey -> WorkerThread(thread, success, failure_message)
         self._downloading = ThreadDict(fields={'success': False, 'failure_message': None})
         self._load_state()
+        # Sync states between dependency-state.json and dependency directories in local file system.
+        self._sync_state()
 
         self._stop = False
         self._main_thread = None
@@ -87,44 +89,78 @@ class LocalFileSystemDependencyManager(StateTransitioner, BaseDependencyManager)
             self._state_committer.commit({'dependencies': self._dependencies, 'paths': self._paths})
 
     def _load_state(self):
+        """
+        Load states from dependencies-state.json file and populate values for self._dependencies,
+        self._dependency_locks and self._paths as follows:
+        1. dependencies-state.json: contains bundles with other information (e.g., stage, dependency, last_used, etc)
+        2. directories in local file system: the bundle contents
+        Ideally, 1. and 2. would be in sync, but life happens and we want to robust to them not being in sync.
+        Therefore, when we load the state from json file, we keep only the bundles that appear in both (1) and (2).
+        :return:
+        """
         state = self._state_committer.load(default={'dependencies': {}, 'paths': set()})
+
         dependencies = {}
         dependency_locks = {}
-        paths = set()
-        for dep_key, dep_state in state['dependencies'].items():
-            full_path = os.path.join(self.dependencies_dir, dep_state.path)
-            if os.path.exists(full_path):
-                dependencies[dep_key] = dep_state
-                dependency_locks[dep_key] = threading.RLock()
-            else:
-                logger.info(
-                    "Dependency {} in loaded state but its path {} doesn't exist in the filesystem".format(
-                        dep_key, full_path
-                    )
-                )
-            if dep_state.path not in state['paths']:
-                state['paths'].add(dep_state.path)
-                logger.info(
-                    "Dependency {} in loaded state but its path {} is not in the loaded paths {}".format(
-                        dep_key, dep_state.path, state['paths']
-                    )
-                )
-        for path in state['paths']:
-            full_path = os.path.join(self.dependencies_dir, path)
-            if os.path.exists(full_path):
-                paths.add(path)
-            else:
-                logger.info(
-                    "Path {} in loaded state but doesn't exist in the filesystem".format(full_path)
-                )
+
+        for dep, dep_state in state['dependencies'].items():
+            dependencies[dep] = dep_state
+            dependency_locks[dep] = threading.RLock()
 
         with self._global_lock, self._paths_lock:
             self._dependencies = dependencies
             self._dependency_locks = dependency_locks
-            self._paths = paths
+            self._paths = state['paths']
+
         logger.info(
-            '{} dependencies, {} paths in cache.'.format(len(self._dependencies), len(self._paths))
+            'Loaded {} dependencies, {} paths from cache.'.format(
+                len(self._dependencies), len(self._paths)
+            )
         )
+
+    def _sync_state(self):
+        """
+        Remove any path that exists in the local file system but not in dependency-state.json file and
+        save the synchronized dependency state and loaded paths back to dependency-state.json file
+        :return:
+        """
+        # Get all the dependency directories in local file system under self.dependencies_dir
+        local_directories = set(os.listdir(self.dependencies_dir))
+
+        # Remove the orphaned dependencies from self._dependencies and
+        # self._dependency_locks if they don't exist in local file system
+        dependencies_to_remove = [
+            dep
+            for dep, dep_state in self._dependencies.items()
+            if dep_state.path not in local_directories
+        ]
+        for dep in dependencies_to_remove:
+            logger.info(
+                "Dependency {} in loaded state but its path {} doesn't exist in the file system. "
+                "Remove it from loaded state.".format(
+                    dep, os.path.join(self.dependencies_dir, self._dependencies[dep].path)
+                )
+            )
+            del self._dependencies[dep]
+            del self._dependency_locks[dep]
+
+        # Get all the paths from loaded state
+        paths_in_loaded_state = [dep_state.path for dep_state in self._dependencies.values()]
+        # Get the paths that exist in loaded state, loaded path and local file system
+        self._paths = self._paths.intersection(paths_in_loaded_state).intersection(
+            local_directories
+        )
+
+        # Remove the orphaned dependencies from local file system
+        directories_to_remove = local_directories - self._paths
+        for dir in directories_to_remove:
+            full_path = os.path.join(self.dependencies_dir, dir)
+            logger.info("Remove orphaned directory {} from the file system.".format(full_path))
+            remove_path(full_path)
+
+        # Save the current state back to the state file: dependency-state.json as
+        # the current state might have been changed during state syncing phase
+        self._save_state()
 
     def start(self):
         logger.info('Starting local dependency manager')
