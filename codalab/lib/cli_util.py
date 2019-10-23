@@ -109,6 +109,11 @@ def desugar_command(orig_target_spec, command):
                     'key %s exists with multiple values: %s and %s' % (key, key2val[key], val)
                 )
         else:
+            if key is None:
+                raise UsageError(
+                    'Dependency is empty. Please provide a valid dependency in the format of :<dependency>.'
+                )
+
             key2val[key] = val
             target_spec.append(key + ':' + val)
         return key
