@@ -299,28 +299,49 @@ class BundleManager(object):
                 logger.info('Bringing bundle offline %s: %s', bundle.uuid, failure_message)
                 self._model.transition_bundle_worker_offline(bundle)
 
-    def _schedule_run_bundles_on_workers(self, workers, user_owned):
+    def _schedule_run_bundles_on_workers(self, workers, staged_bundles_to_run):
         """
         Schedules STAGED bundles to run on the given workers. If user_owned is
         True, then schedules on workers run by the owner of each bundle.
         Otherwise, uses CodaLab-owned workers, which have user ID root_user_id.
         """
-        for bundle in self._model.batch_get_bundles(state=State.STAGED, bundle_type='run'):
-            if user_owned:
-                workers_list = workers.user_owned_workers(bundle.owner_id)
-            else:
+        # Reorder the stage_bundles so that bundles which were requested to run on a personal worker
+        # will be scheduled to run first
+        staged_bundles_to_run.sort(
+            key=lambda b: (b[0].metadata.request_queue is not None, b[0].metadata.request_queue),
+            reverse=True,
+        )
+
+        for bundle, bundle_resources in staged_bundles_to_run:
+            # Get user_owned workers.
+            private_workers = workers.user_owned_workers(bundle.owner_id)
+
+            # If there is no user_owned worker, try to schedule the current bundle to run on a CodaLab's public worker.
+            if not private_workers:
+                # Check if there is enough parallel run quota left for this user
                 if not self._model.get_user_parallel_run_quota_left(bundle.owner_id):
                     logger.info(
                         "User %s has no parallel run quota left, skipping job for now",
                         bundle.owner_id,
                     )
-                    continue  # Don't start this bundle yet
-                workers_list = workers.user_owned_workers(self._model.root_user_id)
+                    # Don't start this bundle yet, as there is no parallel_run_quota left for this user.
+                    continue
+            # Get all the CodaLab's public workers
+            public_workers = workers.user_owned_workers(self._model.root_user_id)
 
-            workers_list = self._deduct_worker_resources(workers_list)
-            bundle_resources = self._compute_bundle_resources(bundle)
-            workers_list = self._filter_and_sort_workers(workers_list, bundle, bundle_resources)
+            # Scan computing resources on both private workers and public workers to see if there is any worker can
+            # have enough computing resources to run the current bundle, in the order of private workers first
+            # and then public workers.
+            workers_lists = [private_workers, public_workers]
+            for workers_list in workers_lists:
+                workers_list = self._deduct_worker_resources(workers_list)
+                workers_list = self._filter_and_sort_workers(workers_list, bundle, bundle_resources)
+                # If the current bundle can be scheduled on a private worker, then schedule it
+                # without scanning computing resources on the rest of public workers.
+                if workers_list:
+                    break
 
+            # Try starting bundles on the workers that have enough computing resources
             for worker in workers_list:
                 if self._try_start_bundle(workers, worker, bundle):
                     break
@@ -351,12 +372,18 @@ class BundleManager(object):
         Filters the workers to those that can run the given bundle and returns
         the list sorted in order of preference for running the bundle.
         """
-
         # keep track of which workers have GPUs
         has_gpu = {}
         for worker in workers_list:
             worker_id = worker['worker_id']
             has_gpu[worker_id] = worker['gpus'] > 0
+
+        # Filter by tag.
+        request_queue = bundle.metadata.request_queue
+        if request_queue:
+            tagm = re.match('tag=(.+)', request_queue)
+            if tagm:
+                workers_list = [worker for worker in workers_list if worker['tag'] == tagm.group(1)]
 
         # Filter by CPUs.
         workers_list = [
@@ -373,17 +400,6 @@ class BundleManager(object):
         workers_list = [
             worker for worker in workers_list if worker['memory_bytes'] >= bundle_resources.memory
         ]
-
-        # Filter by tag.
-        request_queue = bundle.metadata.request_queue
-        if request_queue:
-            tagm = re.match('tag=(.+)', request_queue)
-            if tagm:
-                workers_list = [worker for worker in workers_list if worker['tag'] == tagm.group(1)]
-            else:
-                # We don't know how to handle this type of request queue
-                # argument.
-                return []
 
         # Sort workers list according to these keys in the following succession:
         #  - whether the worker is a CPU-only worker, if the bundle doesn't request GPUs
@@ -592,12 +608,11 @@ class BundleManager(object):
         self._cleanup_dead_workers(workers)
         self._restage_stuck_starting_bundles(workers)
         self._bring_offline_stuck_running_bundles(workers)
-        self._fail_on_too_many_resources()
         self._acknowledge_recently_finished_bundles(workers)
+        staged_bundles_to_run = self._fail_on_too_many_resources()
 
         # Schedule, preferring user-owned workers.
-        self._schedule_run_bundles_on_workers(workers, user_owned=True)
-        self._schedule_run_bundles_on_workers(workers, user_owned=False)
+        self._schedule_run_bundles_on_workers(workers, staged_bundles_to_run)
 
     @staticmethod
     def _check_resource_failure(
@@ -627,7 +642,11 @@ class BundleManager(object):
         Fails bundles that request more resources than available for the given user.
         Note: allow more resources than available on any worker because new
         workers might get spun up in response to the presence of this run.
+
+        :return: a list of tuple which contains valid staged bundles and their bundle_resources.
         """
+        # Keep track of staged bundles that have valid resources requested
+        staged_bundles_to_run = []
         for bundle in self._model.batch_get_bundles(state=State.STAGED, bundle_type='run'):
             bundle_resources = self._compute_bundle_resources(bundle)
             failures = []
@@ -673,3 +692,7 @@ class BundleManager(object):
                     bundle,
                     {'state': State.FAILED, 'metadata': {'failure_message': failure_message}},
                 )
+            else:
+                staged_bundles_to_run.append((bundle, bundle_resources))
+
+        return staged_bundles_to_run
