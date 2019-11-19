@@ -8,6 +8,7 @@ created if not.
 
 import logging
 import os
+import random
 import docker
 
 from codalab.lib.formatting import parse_size
@@ -142,7 +143,7 @@ def start_bundle_container(
         environment['NVIDIA_VISIBLE_DEVICES'] = ','.join(gpuset) if gpuset else 'all'
 
     # Name the container with the UUID for readability
-    container_name = 'codalab_run_%s' % uuid
+    container_name = 'codalab_run_{}_{}'.format(uuid, random.randint(0, 999999))
     container = client.containers.run(
         image=docker_image,
         command=docker_command,
